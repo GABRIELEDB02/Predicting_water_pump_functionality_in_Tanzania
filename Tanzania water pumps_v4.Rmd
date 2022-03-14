@@ -1,0 +1,1150 @@
+---
+title: "Tanzanian Water Pumps"
+output: html_document
+---
+
+### PRELIMINARY ACTIVITIES ###
+
+Libraries import:
+
+```{r, message=FALSE, warning=FALSE}
+
+# For importing, pre-process and transform data
+library(data.table)
+library(dplyr)
+library(tidylog)
+library(plyr)
+library(lubridate)
+library(forcats)
+library(tibble)
+
+# For visualizing data
+library(ggplot2)
+library(ggthemes)
+library(kableExtra)
+
+# For data exploration
+library(autoEDA)
+library(gtsummary)
+library(purrr)
+library(DataExplorer)
+
+# For modeling
+library(randomForest)
+library(caret)
+library(Boruta)
+
+```
+
+Data import, converting all characters to factors. I decided to use URL to import input data in order to make my workflow reproducible on other local machines:
+
+```{r, message=FALSE, warning=FALSE}
+# Import independent variables training set
+
+Training_url <- "http://s3.amazonaws.com/drivendata/data/7/public/4910797b-ee55-40a7-8668-10efd5c1b960.csv"
+
+Training_set_ind_vars <- fread(Training_url, stringsAsFactors = T)
+
+# Import target variable training set
+
+train_labels_url <- "http://s3.amazonaws.com/drivendata/data/7/public/0bf8bc6e-30d0-4c50-956a-603fc693d966.csv"
+
+Training_set_target_var <- fread(train_labels_url, stringsAsFactors = T)
+
+# Import test set
+
+test_set_url <- "http://s3.amazonaws.com/drivendata/data/7/public/702ddfc5-68cd-4d1d-a0de-f5f566f76d91.csv"
+
+Test_set <- fread(test_set_url, stringsAsFactors = T)
+
+# Removing redundant objects
+rm(Training_url,train_labels_url,test_set_url)
+```
+
+
+### DATA PRE-PROCESSING ###
+
+Joining independent and dependent variables in a whole training set:
+
+```{r}
+# Create complete training set
+Training_set_complete <- Training_set_ind_vars %>%
+  left_join(Training_set_target_var)
+
+# Remove no more useful tables
+rm(Training_set_target_var)
+rm(Training_set_ind_vars)
+```
+
+
+Verifying all labeled records:
+
+```{r}
+sum(is.na(Training_set_complete$status_group))
+sum(Training_set_complete[,status_group==""])
+
+# all records are properly labeled
+```
+
+
+Verifying no duplicated records exist within training set (obviously excluding "id"):
+
+```{r}
+
+nrow(unique(Training_set_complete[,-"id"])) 
+
+# so there exist 36 records (59.400-59.364) with all features equal except for "id"
+```
+
+Isolating an example of duplicate record:
+
+```{r, message=FALSE}
+
+# Creating a table including only distinct records
+dups <- distinct(Training_set_complete[,-"id"])
+
+# Bringing unique key to just created table
+dups <- dups %>%
+  left_join(Training_set_complete)
+
+# Getting not unique records by joining for all fields but "id"
+dups %>%
+  dplyr::group_by(amount_tsh, date_recorded, funder, gps_height, installer, longitude, latitude, wpt_name, num_private, basin, subvillage, region, region_code, district_code, lga, ward, population, public_meeting, recorded_by, scheme_management, scheme_name, permit, construction_year, extraction_type, extraction_type_group, extraction_type_class, management, management_group, payment, payment_type, water_quality, quality_group, quantity, quantity_group, source, source_type, source_class, waterpoint_type, waterpoint_type_group, status_group) %>%
+  dplyr::summarise(count=n()) %>%
+  dplyr::filter(count>1) %>%
+  dplyr::arrange((desc(count))) %>%
+  kbl() %>%
+  kable_paper() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+# So these are duplicated records that should be treaten
+
+```
+
+Displaying a case of duplicate records:
+
+```{r}
+Training_set_complete %>%
+  filter(id %in% c("68204", "28134", "7900"))
+# we get 3 records 
+
+# let's apply a distinct (removing "id")
+Training_set_complete %>%
+  filter(id %in% c("68204", "28134", "7900")) %>%
+  select(-"id") %>%
+  distinct() %>%   
+  kbl() %>%
+  kable_paper() %>%
+  kable_styling(bootstrap_options = c("hover", "condensed"))
+
+# in fact we get only one observation, so all features are equal
+```
+
+If this were a real assignment by one of our Client, I will take time to help them investigate which was the issue related to these cases (maybe an issue of data collection/data quality or maybe we have extracted a subset of all available features and we are not able to display the feature able to distinguish between these three records).
+
+For the sake of this exercise, I will simply consider this a data quality issue and I will remove duplicated records from training set:
+
+```{r}
+
+# Exluding "id" 
+Training_and_test_set <- unique(Training_set_complete[,-"id"])
+
+# Creating a join to bring back "id" taking only first occurrence as "id"
+Training_and_test_set <- join(Training_and_test_set, Training_set_complete, type="left", match="first")
+
+
+# From now on we will work on 74.214 observations (59.364 from training set and 14.850 from test set) instead of 74.250.
+
+# Let's remove objects in global environment no more useful
+rm(dups)
+rm(Training_set_complete)
+```
+
+Appending training and test set in order to avoid repeating data preparations step. We will split again training and test set before modeling.
+
+Please note that I decided to run analysis of duplicated records only on training set because I do now want to modify number of rows of test sets. Again, if this were a real assignment, I would have run this analysis on both and discussed results with Client because I do not think it is useful to predict on data that are exactly the same of other records.
+
+```{r}
+# Let's add target variable to test set always populated with "NOT AVAILABLE" 
+Test_set$status_group <- "NOT AVAILABLE"
+
+# Let's add a variable to both training and test set in order to trace where each record belongs to
+Training_and_test_set$Split <- "Training set"
+Test_set$Split <- "Test set"
+
+# Let's append tables
+Training_and_test_set <- rbind(Training_and_test_set, Test_set)
+
+# Let's remove redundant columns
+rm(Test_set)
+```
+
+
+High-level training dataset overview:
+
+```{r}
+str(Training_and_test_set)
+```
+
+Converting data types to most suitable ones:
+
+```{r}
+Training_and_test_set$region_code <- as.factor(Training_and_test_set$region_code)
+Training_and_test_set$district_code <- as.factor(Training_and_test_set$district_code)
+Training_and_test_set$id <- as.factor(Training_and_test_set$id)
+Training_and_test_set$date_recorded <- as.Date(Training_and_test_set$date_recorded)
+Training_and_test_set$Split <- as.factor(Training_and_test_set$Split)
+```
+
+
+
+### FEATURE ENGINEERING ###
+
+
+First summary of training set:
+
+```{r}
+summary(Training_and_test_set)
+```
+
+Let's create a report on dataset using DataExplorer, especially to analyze NA's:
+
+```{r}
+#create_report(Training_and_test_set)
+```
+
+Looking at the report, I can see that about 83% of features are categorical while about 17% are continuous ones. 
+
+We do also have about 90% records reporting values on all features (so 10% records do have some missing values)
+
+Moreover, `permit` and `public_meeting` are columns with the most missing values but they can be fixed with some data imputation since only 5% of values is NA.
+
+We do also have several different blanks and "unknown" values across the features set.
+
+We can start by excluding from our analysis the feature `recorded_by` since all records are reporting the same category (adding no information overall):
+
+```{r}
+
+# Let's verify that `recorded_by` only assumes one value
+Training_and_test_set %>%
+  select(recorded_by) %>%
+  distinct()
+
+# Removing the variable
+Training_and_test_set <- Training_and_test_set[,-"recorded_by"]
+```
+
+
+Across dataset it seems like there is redundant information with several features proving similar information.
+
+Let's study features that seem to provide same kind of information:
+
+focus: `payment_type` vs `payment` 
+
+```{r}
+Training_and_test_set %>% 
+  group_by(payment_type, payment) %>% 
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# These two features seem exactly the same, so let's remove one of them
+
+Training_and_test_set <- Training_and_test_set[,-"payment"]
+
+```
+
+
+focus: `quality_group` vs `water_quality`
+
+```{r}
+Training_and_test_set %>%
+  group_by(quality_group, water_quality) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# These two features seem to be very similar but `water_quality` is more detailed. Let's keep only this feature
+
+Training_and_test_set <- Training_and_test_set[,-"quality_group"]
+
+```
+
+focus: `quantity_group` vs `quantity`
+
+```{r}
+Training_and_test_set %>% 
+  group_by(quantity_group, quantity) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# These two features are exactly the same. Let's keep only one of them.
+
+Training_and_test_set <- Training_and_test_set[,-"quantity_group"]
+```
+
+focus: `waterpoint_type_group` vs `waterpoint_type`
+
+```{r}
+Training_and_test_set %>%
+  group_by(waterpoint_type_group, waterpoint_type) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# These two features seem to be very similar but `waterpoint_type` is a bit more detailed. Let's keep only this feature
+
+Training_and_test_set <- Training_and_test_set[,-"waterpoint_type_group"]
+```
+
+
+focus: geo data
+
+It seems like several variables seem to describe the location with an increasing precision: `region`, `region_code`, `district_code`, `ward`, `subvillage`, `lga`, `longitude` and `latitude`
+
+```{r}
+Training_and_test_set %>% 
+  group_by(region, region_code, district_code) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# So`region` and `district_code` do not have missing values
+```
+
+The issue is that some values of `longitude` and `latitude` fields are probably not right but we do want to retain and value these features because of their potential predictive power:
+
+```{r}
+# Let's display how latitude and longitude distribute
+
+ggplot(Training_and_test_set, aes(x = longitude, y = latitude)) + geom_point(shape = 1)
+
+# We can clearly see that the vast majority of observations are concentrated in the right part of the graph. This implies that values equal to 0 are likely to be data quality issues
+
+# Having more time to allocate on this, I would download/scrape a list of range (max and min latitude and longitude for Tanzania) in order to accurately understand which values are not right.
+```
+
+For the sake of this exercise, let's remove and replace 0 values on `latitude` and `longitude` that certainly do not identify locations within Tanzania:
+
+```{r}
+# Replacing zero values with NA
+Training_and_test_set <- Training_and_test_set %>%
+  mutate(latitude = ifelse(latitude > -1e-06, NA, latitude)) %>%
+  mutate(longitude = ifelse(longitude < 1e-06, NA, longitude))
+
+# Displaying new distribution
+ggplot(Training_and_test_set, aes(x = longitude, y = latitude)) + geom_point(shape = 1)
+
+# It seems like now we do have a far better distribution. Nevertheless we need to impute values for missing data.
+```
+
+
+In order to get values for replacing NA, let's use the always populated fields `region`, and `district_code`to calculate mean latitude and longitude for each combination:
+
+```{r}
+# Let's compute averages in districts (just in case the above is also NA)
+Training_and_test_set <- Training_and_test_set %>% 
+  group_by(region,district_code) %>%
+  mutate(district.long = mean(longitude, na.rm = TRUE)) %>%
+  mutate(district.lat = mean(latitude, na.rm = TRUE)) %>%
+  ungroup()
+
+# Let's compute averages in regions (just in case the above is also NA)
+Training_and_test_set <- Training_and_test_set %>%
+  group_by(region) %>%
+  mutate(region.long = mean(longitude, na.rm = TRUE)) %>%
+  mutate(region.lat = mean(latitude, na.rm = TRUE)) %>%
+  ungroup()
+
+# Impute missing longitude and latitude values
+Training_and_test_set <- Training_and_test_set %>%
+  mutate(longitude = ifelse(!is.na(longitude), longitude,
+                            ifelse(!is.na(district.long), district.long, region.long))) %>%
+  mutate(latitude = ifelse(!is.na(latitude), latitude,
+                           ifelse(!is.na(district.lat), district.lat, region.lat)))
+
+# Verify latitude and longitude no more have missing data
+sum(is.na(Training_and_test_set$latitude)) + sum(is.na(Training_and_test_set$longitude))
+
+# Changes have been properly implemented.
+
+```
+
+After this step, we can drop some geo features in order to avoid redundant information. My choice is to keep an high-level categorical feature, such as `region`, and the most precise geo features `latitude` and `longitude`.
+
+We can then drop all other geo features, including those we created in previous step for data imputation.
+
+```{r}
+Training_and_test_set <- Training_and_test_set %>% 
+  select( - region_code,
+          - district_code,
+          - region.long,
+          - region.lat,
+          - district.long,
+          - district.lat,
+          - ward , 
+          - subvillage)
+```
+
+Let's explore last feature: `lga`
+
+```{r}
+Training_and_test_set %>%
+  group_by(region, lga) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# This feature is quite interesting because it splits some region in urban and rural areas. We can extract from this variable this kind of information, creating a third category called "other" for all cases where `lga` is not urban nor rural
+
+
+Training_and_test_set <- Training_and_test_set %>% mutate(lga = ifelse( grepl(" Rural", lga), "Rural",
+                                     ifelse( grepl(" Urban", lga), "Urban","Other")))
+
+# Convert again to factor
+Training_and_test_set$lga <- as.factor(Training_and_test_set$lga)
+
+# Let's check if transformation has been done right
+summary(Training_and_test_set$lga)
+
+# Transformation has been properly applied then
+```
+
+focus: `construction_year` and `date_recorded`
+
+Since we have construction year and year when data were recorded, we can use these features to compute years of operation for each pump:
+
+```{r}
+# Computing operation years
+Training_and_test_set <- Training_and_test_set %>% 
+  mutate(date_recorded = ymd(date_recorded)) %>%
+  mutate(operation_years = lubridate::year(date_recorded) - construction_year) %>%
+  mutate(operation_years = ifelse(operation_years < 0, NA, operation_years))
+
+# I also put equal to NA all those cases where we get a negative number
+
+# Let's check results:
+summary(Training_and_test_set$operation_years)
+
+# Since we do have only 12 missing values for this new feature, we can impute the mean value for those cases
+
+Training_and_test_set <- Training_and_test_set %>%
+  mutate(operation_years = ifelse(is.na(operation_years), mean(operation_years, na.rm = T), operation_years))
+
+```
+
+Doing some research about whether in Tanzania, I found that the country has two rainy seasons: 
+-> The short rains from late-October to late-December
+-> The long rains from March to May
+
+So let's create a feature reporting the season. Moreover, if a seasonal effect exists, it might be good to include the recorded day of the year as an integer from 1 to 365:
+
+
+```{r}
+# Calculating season
+Training_and_test_set <- Training_and_test_set %>%
+  mutate(day_of_year = yday(date_recorded)) %>%
+  mutate(month_recorded = lubridate::month(date_recorded)) %>%
+  mutate(season = ifelse( month_recorded <= 2, "dry short",
+                          ifelse( month_recorded <= 5, "wet long",
+                                  ifelse(month_recorded <= 9, "dry long", "wet short")))) 
+
+# Convert variable to factor
+Training_and_test_set$season <- as.factor(Training_and_test_set$season)
+
+# Let's remove redundant features 
+Training_and_test_set <- Training_and_test_set %>%
+  select( - date_recorded, - month_recorded, - construction_year)
+```
+
+Now some features do have too many levels. According to my experience, having such a number of levels could impact model accuracy as well as computational time. I need to find a way to deal with these features.
+
+Let's explore `funder`:
+
+```{r}
+Training_and_test_set %>%
+  group_by(funder) %>%
+  tally()
+
+# This feature has about 2k level. We need to keep only most frequent ones and collapse other levels into category "other"
+```
+
+In a real assignment, I would have investigated with Client the possibility to reduce levels creating significant buckets (for example, public vs private funders). Since I do not have enough information here to perform this task, I will simply collapse- levels of `funder` to 50 levels:
+
+```{r}
+
+# First of all, we do have blanks and 0 values (that, for the kind of information this field manages, have no means). Let's convert these two categories into category "Unknown"
+
+Training_and_test_set$funder <- as.character(Training_and_test_set$funder)
+
+Training_and_test_set$funder <- ifelse(Training_and_test_set$funder=="" | Training_and_test_set$funder=="0", "Unknown", Training_and_test_set$funder)
+
+
+# Let's create 50 levels for this feature:
+Training_and_test_set <- Training_and_test_set %>%
+  mutate(funder= fct_lump(funder, n=49, other_level = "Other"))
+
+# Convert feature to factor
+Training_and_test_set$funder <- as.factor(Training_and_test_set$funder)
+
+# Let's check results
+levels(Training_and_test_set$funder)
+
+```
+
+Let's explore `installer`:
+
+```{r}
+Training_and_test_set %>%
+  group_by(installer) %>%
+  tally()
+
+# Also this feature has more than 2k level. We need to keep only most frequent ones and collapse other levels into category "other"
+```
+
+In a real assignment, I would have investigated with Client the possibility to reduce levels creating significant buckets (for example, public vs private installers). Since I do not have enough information here to perform this task, I will simply collapse levels of `installer` to 50 levels:
+
+```{r}
+
+# First of all we do have blanks, "-" and 0 values (that, for the kind of information this field manages, have no means). Let's convert these three categories into category "Unknown"
+
+Training_and_test_set$installer <- as.character(Training_and_test_set$installer)
+
+Training_and_test_set$installer <- ifelse(Training_and_test_set$installer=="" | Training_and_test_set$installer=="0" | Training_and_test_set$installer=="-", "Unknown", Training_and_test_set$installer)
+
+
+# Let's create 50 levels for this feature:
+Training_and_test_set <- Training_and_test_set %>%
+  mutate(installer= fct_lump(installer, n=49, other_level = "Other"))
+
+# Convert feature to factor
+Training_and_test_set$installer <- as.factor(Training_and_test_set$installer)
+
+# Let's check results
+levels(Training_and_test_set$installer)
+
+
+```
+
+Let's explore `wpt_name`:
+
+```{r}
+Training_and_test_set %>%
+  group_by(wpt_name) %>%
+  tally()
+
+# This feature presents about 45k unique levels. At first look, this is a bit strange because I would have expected a unique name for each pump. In a real assignment, I would have asked Client about this, but, for the sake of this exercise, let's drop this variable that it is too fragmented
+
+Training_and_test_set <- Training_and_test_set %>%
+  select(-wpt_name)
+```
+
+focus: `scheme_management`
+
+```{r}
+Training_and_test_set %>%
+  group_by(scheme_management) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# Let's replace blanks and "None" with "Unknown"
+
+# Convert feature to character
+Training_and_test_set$scheme_management <- as.character(Training_and_test_set$scheme_management) 
+
+# Add unknown category
+Training_and_test_set$scheme_management <- ifelse(Training_and_test_set$scheme_management=="" | Training_and_test_set$scheme_management=="None", "Unknown", Training_and_test_set$scheme_management)
+
+# Convert data type to factor
+Training_and_test_set$scheme_management <- as.factor(Training_and_test_set$scheme_management) 
+```
+
+focus: `scheme_name`
+
+```{r}
+Training_and_test_set %>%
+  group_by(scheme_name) %>%
+  tally()
+
+# This feature seems to be a detailed version of scheme_management but it is very dirty (several names seem to be the same but recorded with different label). I do prefer to drop this one because, for the sake of this exercise, properly clean data would require too much time
+
+Training_and_test_set <- Training_and_test_set %>%
+  select(-scheme_name)
+```
+
+focus: `extraction_type_class` vs `extraction_type_group`vs `extraction_type`
+
+```{r}
+Training_and_test_set %>%
+  group_by(extraction_type_class, extraction_type_group, extraction_type) %>% 
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# It seems like each variable is a more detailed version of the previous one. Nevertheless, `extraction_type_group`vs `extraction_type` are very similar so we will drop the mid-level 
+
+Training_and_test_set <- Training_and_test_set %>%
+  select(-extraction_type_group)
+
+# After first run of the model I noticed that `extraction_type`="other - mkulima/shinyanga" only exists as a level for training set (while it is not present in test set)
+
+Training_and_test_set %>%
+  select(Split, extraction_type) %>%
+  distinct() %>%
+  arrange(extraction_type) %>%
+  kbl() %>%
+  kable_paper()
+
+levels(Training_and_test_set$extraction_type)
+
+# We will put this in "other" bucket
+
+Training_and_test_set$extraction_type <- as.character(Training_and_test_set$extraction_type)
+
+Training_and_test_set$extraction_type <- ifelse(Training_and_test_set$extraction_type=="other - mkulima/shinyanga", "other", Training_and_test_set$extraction_type)
+
+Training_and_test_set$extraction_type <- as.factor(Training_and_test_set$extraction_type)
+
+levels(Training_and_test_set$extraction_type)
+
+```
+
+focus: `num_private`
+
+```{r}
+Training_and_test_set %>%
+  group_by(num_private) %>% 
+  tally() %>%
+  kbl() %>%
+  kable_paper() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = F)
+
+# This variable is mostly 0, while all the other numbers have very few occurrences. We can then keep this variable, focusing on difference between 0 and other values
+
+Training_and_test_set$num_private <- ifelse(Training_and_test_set$num_private == 0, "Zero", "Non zero")
+
+# Convert to factor
+Training_and_test_set$num_private <- as.factor(Training_and_test_set$num_private)
+
+# Checking results
+summary(Training_and_test_set$num_private)
+
+```
+
+It should be noted that there are zero values also for features `population`, `gps_height` and `amount_tsh`. Since data dictionary for this case is not very clear, I do not have enough information to state these are data quality issues. In a real assignment I would have discussed this with Client but, for the sake of the exercise, I will consider these values to be ok.
+
+
+focus: `public_meeting`
+
+```{r}
+Training_and_test_set %>%
+  group_by(public_meeting) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# We do have about 4k NAs that need to be imputed. I will replace NAs with "Unknown" category
+
+Training_and_test_set$public_meeting <- as.character(Training_and_test_set$public_meeting)
+
+Training_and_test_set$public_meeting <- ifelse(is.na(Training_and_test_set$public_meeting), "Unknown", Training_and_test_set$public_meeting)
+
+Training_and_test_set$public_meeting <- as.factor(Training_and_test_set$public_meeting)
+
+```
+
+focus: `permit`
+
+```{r}
+Training_and_test_set %>%
+  group_by(permit) %>%
+  tally() %>%
+  kbl() %>%
+  kable_paper()
+
+# We do have about 4k NAs that need to be imputed. I will replace NAs with "Unknown" category
+
+Training_and_test_set$permit <- as.character(Training_and_test_set$permit)
+
+Training_and_test_set$permit <- ifelse(is.na(Training_and_test_set$permit), "Unknown", Training_and_test_set$permit)
+
+Training_and_test_set$permit <- as.factor(Training_and_test_set$permit)
+```
+
+Now let's check if we do still have have NAs and blank across dataset:
+
+```{r}
+sum(is.na(Training_and_test_set))
+sum(Training_and_test_set=="")
+
+# We had successfully removed all NAs and blank values. Dataset is ready for modeling
+```
+
+Now that dataset is clean, let's check left variables:
+
+```{r}
+colnames(Training_and_test_set)
+```
+
+
+### DATA EXPLORATION ###
+
+Let's explore how independent variables interact with target variable:
+
+```{r}
+#autoEDA::autoEDA(Training_and_test_set, "status_group")
+```
+
+Let's make a plot to understand which is actual situation in terms of working/faulty pumps across the Country:
+
+```{r}
+Training_and_test_set %>%
+  filter(status_group!="NOT AVAILABLE") %>%
+  ggplot(mapping = aes(x=status_group, fill=status_group)) +
+  geom_bar(stat = "count") +
+  stat_count(geom = "text", colour = "white", size = 3.5,
+aes(label = ..count..),position=position_stack(vjust=0.5))
+```
+
+It seems clear from the graph above why Tanzanian Ministry of Water is interested in addressing the problem. It seems that out of 59.364 water pumps located across Tanzania, almost 46% are not working properly (need repair or not working at all)
+
+
+## NUMERICAL FEATURES STUDY ##
+
+
+Let's see how `latitude` and `longitude` behave with respect to target variable:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(status_group!="NOT AVAILABLE") %>%
+ggplot(mapping =  aes(x = longitude, y = latitude)) + 
+  geom_point(shape = 1,aes(color=status_group))
+```
+
+Looking at this scatterplot we can already see that some categories are concentrated at specific latitudes and longitudes. For example, at the bottom right corner, there is a strong prevalence of non functional water pumps. That's why I would bet this variable will be important for models in a later phase.
+
+Another way to look at this is:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(status_group!="NOT AVAILABLE") %>%
+ggplot(mapping =  aes(x = longitude, y = latitude)) + 
+  geom_point(shape = 1,aes(color=status_group)) +
+   facet_grid(. ~ status_group)
+```
+
+
+We can also study this phenomenon using histograms :
+
+```{r, message=FALSE}
+# Explore longitude
+Training_and_test_set %>%
+  filter(Split=="Training set") %>%
+ggplot(mapping=aes(x = longitude,fill=status_group)) + 
+  geom_histogram(bins = 20) +   
+  facet_grid( ~ status_group) +
+  theme_fivethirtyeight()
+
+# Explore latitude
+Training_and_test_set %>%
+  filter(Split=="Training set") %>%
+ggplot(mapping=aes(x = latitude,fill=status_group)) + 
+  geom_histogram(bins = 20) +   
+  facet_grid( ~ status_group) +
+  theme_fivethirtyeight()
+```
+
+Let's see how `amount_tsh` behave with respect to target variable:
+
+```{r, message=FALSE}
+Training_and_test_set %>%  
+    filter(status_group!="NOT AVAILABLE") %>%
+    select(amount_tsh, status_group) %>%
+    split(.$status_group) %>%
+    map(summary)
+
+```
+
+What is really interesting about this feature is that it seems very correlated to target. The less the `amount_tsh` the more is likely that pump is faulty. We can indeed see that mean value decrease from "functional" (where it is 462) to "non functional" (where it is 123). My consideration here is that bigger waterpoints are less subject to failures than smaller ones.
+
+
+Let's explore `gps_height`:
+
+```{r, message=FALSE}
+Training_and_test_set %>%  
+    filter(status_group!="NOT AVAILABLE") %>%
+    select(gps_height, status_group) %>%
+    split(.$status_group) %>%
+    map(summary)
+```
+
+Even this variable seems to have some predict power because the The less the `gps_height` more is likely that pump is faulty.
+
+Let's look at `population`:
+
+```{r, message=FALSE}
+Training_and_test_set %>%  
+    filter(status_group!="NOT AVAILABLE") %>%
+    select(population, status_group) %>%
+    split(.$status_group) %>%
+    map(summary)
+```
+
+Even this variable seems to have some predict power because the The less the `pupulation` the more is likely that pump is faulty.
+
+And lastly let's look at `operation_years`, one of the features we decided to create starting from existing data:
+
+
+```{r, message=FALSE}
+Training_and_test_set %>%  
+    filter(status_group!="NOT AVAILABLE") %>%
+    select(operation_years, status_group) %>%
+    split(.$status_group) %>%
+    map(summary)
+```
+
+As one would expect, here seems that older pumps are more likely to be faulty.
+
+## CATEGORICAL FEATURES STUDY ##
+
+Let's look at `payment_type`:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  select(payment_type,
+         status_group) %>%
+  tbl_summary(by=status_group, percent = "row") %>%
+  add_n()
+```
+
+It is possibile to clearly note how `payment_type` can provide useful information on water pumps status. In fact, free waterpoints (the ones for which no payment is requested) are very sensitive to failures with respect to all the others.
+
+A powerful way to look at this is:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  ggplot(mapping = aes(x=payment_type,fill=status_group)) +
+  geom_bar(stat="count", position = "fill")
+```
+
+
+Let's explore `source`:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  select(source,
+         status_group) %>%
+  tbl_summary(by=status_group, percent = "row") %>%
+  add_n()
+```
+
+We can note here that when `source` is a lake, the probability that pumps is not working properly is very high. This variable can also be related to geographical location seen before.
+
+Let's display this:
+
+```{r}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  ggplot(mapping = aes(x=source,fill=status_group)) +
+  geom_bar(stat="count", position = "fill") + 
+  coord_flip()
+```
+
+
+Let's study `quantity`:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  select(quantity,
+         status_group) %>%
+  tbl_summary(by=status_group, percent = "row") %>%
+  add_n()
+```
+
+Even looking at these feature there are some interesting elements. For example, if we consider feature `quantity` we can clearly see that category "dry" is strongly indicative of a non functional pump. This implies that this variable will be very useful in predicting water pumps status.
+
+From a graphical point of view:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  ggplot(mapping = aes(x=quantity,fill=status_group)) +
+  geom_bar(stat="count", position = "fill")
+```
+
+Let's explore `basin`:
+
+```{r, message=FALSE}
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  select(basin,
+         status_group) %>%
+  tbl_summary(by=status_group, percent = "row") %>%
+  add_n()
+
+
+Training_and_test_set %>%
+  filter(Split!="Test set") %>%
+  ggplot(mapping = aes(x=basin,fill=status_group)) +
+  geom_bar(stat="count", position = "fill") + 
+  coord_flip()
+```
+
+Again, geo features are very interesting. Here, for exapmple, it seems clear that water pumps located in Ruvuma/Southern Coast Basin are more likely to be faulty.
+
+### MODELING ###
+
+Preparing data for Random Forest:
+
+```{r, warning=FALSE}
+# Seed to make reproducible results
+set.seed(7)
+
+# Create test set
+test_set_rf <-Training_and_test_set %>%
+  filter(Split=="Test set") %>%
+  select(-status_group)
+
+# Create training
+training_set_rf <-Training_and_test_set %>%
+  filter(Split=="Training set") %>%
+  select(-"id")
+
+# Crete validation set that we will use to calculate accuracy out-of-sample
+set.seed(7)
+ind <- createDataPartition(training_set_rf$status_group,times=1,p=0.7,list=FALSE)
+training_set_rf <- training_set_rf[ind,]
+validation_set_rf <- training_set_rf[-ind,]
+
+# Drop helper feature
+test_set_rf$Split <- NULL
+training_set_rf$Split <- NULL
+validation_set_rf$Split <- NULL
+
+# Drop no more useful objects
+rm(ind)
+
+# It's a 80-20 split, as usual in ML models. 
+```
+
+
+Before running the model, we can check with Boruta which variables are signigicant in predicting target variable.
+
+Boruta is an all relevant feature selection wrapper algorithm, capable of working with any classification method that output variable importance measure. By default, Boruta uses Random Forest and since we are going to apply random forest in the next step, it is suitable for our case, even using standard parameters:
+
+
+```{r}
+#set.seed(7)
+#boruta <- Boruta(status_group ~ ., data = training_set_rf, doTrace = 2, maxRuns = 500)
+#print(boruta)
+```
+
+
+Let's plot importance:
+
+```{r}
+#plot(boruta, las = 2, cex.axis = 0.7)
+```
+
+#Let's train a RF classifier with default parameters:
+
+ Please note that, after first running of the model, I calculated feature importance and decided to drop less significant features:
+`basin`
+`source`
+`amount_tsh`
+`scheme_management`
+`management`
+`source_type`
+`water_quality`
+`season`
+`Public_meeting`
+`permit`
+`lga`
+`management_group`
+`source_class`
+`num_private`
+
+Even if boruta found `num_private` to be the only non-important feature, according to my experience, if it's possible to reach same accuracy using less features, it is always a good choice. Simpler models are easier to explain and require less computational time.
+
+
+Let's train a Random Forest classifier:
+
+```{r}
+#
+training_set_rf <- droplevels(training_set_rf)
+
+set.seed(7)
+rf_model <- randomForest(status_group ~
+                           quantity 
+                         + longitude
+                         + latitude
+                         + day_of_year
+                         + gps_height
+                         + waterpoint_type
+                         + extraction_type
+                         + funder
+                         + operation_years
+                         + population
+                         + payment_type
+                         + extraction_type_class
+                         + installer
+                         + region,
+                         data = training_set_rf,
+                         mtry=4)
+
+# Our forest do have 500 as number of trees and 4 as number of variables tried at each split (mtry). In the following chuck I've used a function to optimize mtry for accuracy. 
+```
+
+Let's tune "mtry" parameter meaning number of features used at each split. We will stick to ntree=500 as standard parameter:
+
+```{r}
+#mtry <- tuneRF(training_set_rf[-26],training_set_rf$status_group, ntreeTry=500,
+               #stepFactor=1.5,improve=0.01, trace=TRUE, plot=TRUE)
+
+#mtry = 5  OOB error = 4.38% 
+
+#mtry = 4 	OOB error = 4.31% 
+ 
+#mtry = 3 	OOB error = 4.32% 
+ 
+#mtry = 7 	OOB error = 4.49% 
+
+# We will use mtry = 4, the one with the smallest out of bag error. After tuning this parameter, overall accuracy in-sample and out-of-sample improved by 1.1%
+```
+
+
+Verify performance on training set (in-sample performance):
+
+```{r}
+training_set_rf$rf_predictions <- predict(rf_model, training_set_rf)
+
+# Compute accuracy
+confusionMatrix(training_set_rf$rf_predictions, training_set_rf$status_group)
+```
+
+Accuracy on training set is 97.7%. We need to verify if we do have a similar performance on validation set, otherwise it is likely model is overfitting.
+
+
+After running the model, it is very important to assess the model before using it to predict on test set. First of all, we would like to verify feature importance:
+
+```{r}
+# Calculate feature importance
+model_importance <- importance(rf_model)
+
+# Plot feature importance
+varImpPlot(rf_model)
+
+# We can see here that some variables are more important than others in predicting status_group
+```
+
+
+Let's identify variables which are not good predictors to our model (done in the first model run):
+
+```{r}
+# Create a column from rowname
+#model_importance <- rownames_to_column(as.data.frame(model_importance), var = "var")
+
+# Calculate average feature importance and standard deviation
+#mean(model_importance$MeanDecreaseGini)
+#sd(model_importance$MeanDecreaseGini)
+#median(model_importance$MeanDecreaseGini)
+
+# Let's drop from model variables with less feature importance. We will identify as not useful all those variables with meandecreasegini less that average-2sd
+
+# Let's calculate a threshold
+#model_importance$threshold <- mean(model_importance$MeanDecreaseGini) -0.5*sd(model_importance$MeanDecreaseGini)
+
+# Display variables not adding value
+#model_importance %>%
+  #filter(MeanDecreaseGini<threshold) %>%
+  #arrange(MeanDecreaseGini)
+```
+
+
+
+Predict on validation set (observations model has never seen before) in order to understand true accuracy (e.g. accuracy out-of-sample):
+
+```{r}
+# Predict on test set
+validation_set_rf$rf_predictions <- predict(rf_model, validation_set_rf)
+```
+
+
+Verify performance on validation set:
+
+```{r}
+
+validation_set_rf <- droplevels(validation_set_rf)
+
+# Compute overall model accuracy accuracy
+confusionMatrix(validation_set_rf$rf_predictions, validation_set_rf$status_group)
+```
+
+Model is performing then with about 97.7% accuracy on validation set (data that model has never seen before). O think it was able enough to generalize rules during traning phase.
+
+
+Nevertheless, looking at sensitivity and specificity we can see that model is performing in a very different way across three categories. Model is fairly good in detecting functional and not functional water pumps, but it finds more difficult to find water pumps that need some repairs.
+
+
+The issue here is that we do have very few observations for category "functional needs repair" with respect to other categories. That's why I would apply undersampling/oversampling techniques in order to rebalance target variable.
+
+However,for the sake of this exercise, we reach a satisfactory performance and applying/optimizing SMOTE techniques would require time.
+
+Just a last note. Having more time to work on this ,I would have followed my standard methodological approach:
+
+1) Implement several algorithms with standard hyper-parameters, computing accuracy rate and confusion matrix for each one
+
+2) Choose the one with best performance at baseline
+
+3) Implement a grid-search in order to fine-tune standard hyper-parameters of the best model
+
+
+Predict status on test set:
+
+```{r}
+# Predict on test set
+test_set_rf$rf_predictions <- predict(rf_model, test_set_rf)
+```
+
+
+Prepare and write file for submission:
+
+```{r}
+# Prepare file
+Submission <- test_set_rf %>%
+  select(id, rf_predictions)
+
+names(Submission)[names(Submission) == "rf_predictions"] <- "status_group"
+
+# Write CSV
+write.csv(Submission,"submission_GDB_2021.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
