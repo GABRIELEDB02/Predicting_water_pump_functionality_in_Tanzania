@@ -13,4 +13,4 @@ Predictive model is trained on data from Taarifa, which aggregates the data from
 Out of 59.364 water pumps located across Tanzania, almost 46% are faulty, meaning they need some repairs or are not working at all.
 
 ## Model development and results
-After collecting the data, we performed some data cleansing activity aimed at improving quality of input data. Then we applied a Random Forest algorithm that is 98% accurate in detecting which water pumps are at greater risk of not functioning properly. After developing the model, we also estimate variable importance in order to understand which factors are more influential.
+After collecting the data, we performed some data cleansing activity in R aimed at improving quality of input data. Then we applied a Random Forest algorithm in R that is 98% accurate in detecting which water pumps are at greater risk of not functioning properly. After developing the model, we also estimate variable importance in order to understand which factors are more influential.
