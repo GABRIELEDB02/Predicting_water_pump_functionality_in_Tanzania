@@ -1,4 +1,4 @@
-# Predicting water pump functionality in Tanzania
+# Predicting water pump functionality in Tanzania using R
 
 ## Summary and projects goals
 Water is crucial to increase quality of living in rural areas. Using data provided by Tanzania Ministry of Water, I developed a supervised classification model to predict which water pumps need repairs or are totally broken.
